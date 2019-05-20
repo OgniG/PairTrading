@@ -18,7 +18,7 @@ MAX_GROSS_EXPOSURE = 1.0
 
 def initialize(context):
     
-    context.stocks = Q3000US()  
+    context.stocks = Q500US()  
     pipe = Pipeline()
     pipe = attach_pipeline(pipe, name = 'pairs')
     pipe.set_screen(context.stocks)
@@ -28,9 +28,12 @@ def initialize(context):
     context.short_ma_length = 1
     context.entry_threshold = 0.2
     context.exit_threshold = 0.1
-    context.universe_size = 100
+    context.universe_size = 500
     context.num_pairs = 4
+    context.coint_cutoff=0.05
+    context.corr_cutoff=0.95
     context.top_yield_pairs = []
+    context.increments=50
     
     context.coint_data = {}
     context.coint_pairs = {}
@@ -105,17 +108,16 @@ def choose_pairs(context, data):
     context.universe = pipeline_output('pairs')
     if (context.universe_size > len(context.universe)):
         context.universe_size = len(context.universe) - 1
-    context.target_weights = pd.Series(index=context.universe.index, data=0.25)
-    for i in range (context.universe_size):
-        for j in range (i+1, context.universe_size):
-            s1 = context.universe.index[i]
-            s2 = context.universe.index[j]
-            #get correlation cointegration values
-            correlation, coint_pvalue = get_corr_coint(data, s1, s2, context.price_history_length)
-            context.coint_data[(s1,s2)] = {"corr": correlation, "coint": coint_pvalue}
-            if (coint_pvalue < 0.05 and correlation > 0.95):
-                context.coint_pairs[(s1,s2)] = context.coint_data[(s1,s2)]      
-    
+    context.target_weights = pd.Series(index=context.universe.index, data=0.25)    
+    counter=0
+    while (counter<=context.universe_size):
+        end=counter+context.increments
+        for i in range (counter,end):
+            for j in range (i+1, context.universe_size):
+                s1 = context.universe.index[i]
+                s2 = context.universe.index[j]
+                populate_pairs(context, data, s1, s2)
+        counter+=context.increments
     for pair in context.coint_pairs:
         long_ma, short_ma = get_mvg_averages(data, pair[0], pair[1], context.long_ma_length, context.short_ma_length)
         long_std = get_std(data, pair[0], pair[1], context.long_ma_length)
@@ -157,6 +159,13 @@ def choose_pairs(context, data):
         context.pair_status[pair] = {}
         context.pair_status[pair]['currently_short'] = False
         context.pair_status[pair]['currently_long'] = False
+
+def populate_pairs(context, data, s1, s2):
+    #get correlation cointegration values
+    correlation, coint_pvalue = get_corr_coint(data, s1, s2, context.price_history_length)
+    context.coint_data[(s1,s2)] = {"corr": correlation, "coint": coint_pvalue}
+    if (coint_pvalue < context.coint_cutoff and correlation > context.corr_cutoff):
+        context.coint_pairs[(s1,s2)] = context.coint_data[(s1,s2)]
             
 #INCOMPLETE
 def check_pair_status(context, data):
