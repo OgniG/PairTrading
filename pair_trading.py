@@ -1,68 +1,104 @@
 #Pair Trading Algorithm
 
 import quantopian.algorithm as algo
+import quantopian.optimize as opt
 from quantopian.pipeline import Pipeline,CustomFactor
 from quantopian.pipeline.data.builtin import USEquityPricing
 from quantopian.pipeline.filters import QTradableStocksUS
+from quantopian.pipeline.data import Fundamentals
+import quantopian.pipeline.classifiers.morningstar
+import quantopian.pipeline.data.morningstar as ms
+
 import numpy as np
 import pandas as pd
 import statsmodels.tsa.stattools as sm
-from quantopian.pipeline.filters import Q500US, Q3000US
-from quantopian.pipeline.data import Fundamentals
-from quantopian.pipeline.classifiers.fundamentals import Sector
-from quantopian.algorithm import attach_pipeline, pipeline_output
-from collections import OrderedDict
+import math
 
 COMMISSION = 0.0035
-MAX_GROSS_EXPOSURE = 1.0
+LEVERAGE = 2.0
+MAX_GROSS_EXPOSURE = LEVERAGE
+INTERVAL = 3
+REC_LEVERAGE = True
+REC_PCT = False
 
 def initialize(context):
     
-    context.stocks = Q500US()  
-    pipe = Pipeline()
-    pipe = attach_pipeline(pipe, name = 'pairs')
-    pipe.set_screen(context.stocks)
-     
-    context.price_history_length = 365
+    set_slippage(slippage.FixedSlippage(spread=0))
+    set_commission(commission.PerShare(cost=COMMISSION))
+    context.industry_code = ms.asset_classification.morningstar_industry_code.latest
+    #ENTER DESIRED SECTOR CODES HERE
+    context.codes = [10209016, 10209017, 10209018, 10209019, 10209020, 30946101, 30947102, 30948103, 30949104, 30950105, 30951106, 10428064, 10428065, 10428066, 10428067, 10428068, 10428069, 10428070, 31167136, 31167137, 31167138, 31167139, 31167140, 31167141, 31167142, 31167143]
+    context.num_universes = len(context.codes)
+    context.universes = {}
+    
+    for code in context.codes:
+        context.universes[code] = {}
+        context.universes[code]['pipe'] = Pipeline()
+        context.universes[code]['pipe'] = algo.attach_pipeline(context.universes[code]['pipe'], 
+                                                          name = str(code))
+        context.universes[code]['pipe'].set_screen(QTradableStocksUS() & 
+                                           context.industry_code.eq(code))
+    
+    context.price_history_length = 730
     context.long_ma_length = 30
     context.short_ma_length = 1
-    context.entry_threshold = 0.2
-    context.exit_threshold = 0.1
-    context.universe_size = 500
-    context.num_pairs = 4
-    context.coint_cutoff=0.05
-    context.corr_cutoff=0.95
+    
+    context.desired_num_pairs = 1
+    context.num_pairs = context.desired_num_pairs
+    context.pvalue_th = 0.01
+    context.corr_th = 0.95
     context.top_yield_pairs = []
-    context.increments=50
+    context.universe_set = False
     
     context.coint_data = {}
     context.coint_pairs = {}
-    context.spreads = {}
-    context.zscores = {}
-    context.real_yields = {}
     context.real_yield_keys = []
     context.pair_status = {}
-    context.pair_weights = {}
+    context.total_stock_list = []
+    context.universe_pool = []
+    
+    context.target_weights = {}
     
     context.lookback = 20 # used for regression
-    context.z_window = 20 # used for zscore calculation, must be <= lookback
+    context.z_window = 10 # used for zscore calculation, must be <= lookback   
+    context.interval_mod = -1
+    #context.spread = np.ndarray((context.num_pairs, 0))
     
-    context.spread = np.ndarray((context.universe_size, 0))
-
-    # Create our dynamic stock selector.
-    algo.attach_pipeline(make_pipeline(), 'pipeline')
-    algo.schedule_function(choose_pairs, date_rules.every_day(), time_rules.market_open(hours=0, minutes=1))
+    schedule_function(choose_pairs, date_rules.month_start(), time_rules.market_open(hours=0, minutes=1))  
+    schedule_function(check_pair_status, date_rules.every_day(), time_rules.market_open(minutes=30))
+    
+#TODO: LEVERAGE HANDLING
+# def warn_leverage(context, data):
+#     log.warn('Leverage Exceeded: '+str(context.account.leverage))
+#     context.open_orders = get_open_orders()
+#     if context.open_orders:
+#         for orders,_ in context.open_orders.iteritems():
+#             cancel_order(orders)
+#     for equity in context.portfolio.positions:  
+#         order_target_percent(equity, 0)
     
 #empty all data structures
 def empty_data(context):
     context.coint_data = {}
     context.coint_pairs = {}
-    context.spreads = {}
-    context.zscores = {}
-    context.real_yields = {}
     context.real_yield_keys = []
     context.top_yield_pairs = []
-    context.pair_weights = {}
+    context.total_stock_list = []
+    
+def empty_target_weights(context):
+    for s in context.target_weights.keys():
+        context.target_weights.loc[s] = 0.0
+    for equity in context.portfolio.positions:  
+        order_target_percent(equity, 0)
+
+def get_stock_partner(context, stock):
+    partner = 0
+    for pair in context.coint_pairs.keys():
+        if stock == pair[0]:
+            partner = pair[1]
+        elif stock == pair[1]:
+            partner = pair[0]
+    return partner     
    
 #calculate total commission cost of a stock given betsize
 def get_commission(data, stock, bet_size):
@@ -93,142 +129,296 @@ def get_std(data, s1, s2, length):
     std = np.std(prices[s1] - prices[s2])
     return std
 
-#Set status of pair
-def set_pair_status(context, pair, top_weight, bottom_weight, currShort, currLong):
-    context.pair_status[pair]['top_weight'] = top_weight 
-    context.pair_status[pair]['bottom_weight'] = bottom_weight
-    context.pair_status[pair]['currently_short'] = currShort
-    context.pair_status[pair]['currently_long'] = currLong
-   
-#select pairs based on correlation, cointegration
-#rank pairs by estimated real yield
-#weight top pairs by correlation
-def choose_pairs(context, data):
+def hedge_ratio(Y, X, add_const=True):
+    if add_const:
+        X = sm.add_constant(X)
+        model = sm.OLS(Y, X).fit()
+        return model.params[1]
+    model = sm.OLS(Y, X).fit()
+    return model.params.values 
+
+def get_current_portfolio_weights(context, data):  
+    positions = context.portfolio.positions  
+    positions_index = pd.Index(positions)  
+    share_counts = pd.Series(  
+        index=positions_index,  
+        data=[positions[asset].amount for asset in positions]  
+    )
+
+    current_prices = data.current(positions_index, 'price')  
+    current_weights = share_counts * current_prices / context.portfolio.portfolio_value  
+    #return current_weights.reindex(positions_index.union(context.universe), fill_value=0.0)  
+    
+    return current_weights.reindex(positions_index.union(context.universe_pool), fill_value=0.0)  
+    
+def computeHoldingsPct(yShares, xShares, yPrice, xPrice):
+    yDol = yShares * yPrice
+    xDol = xShares * xPrice
+    notionalDol =  abs(yDol) + abs(xDol)
+    y_target_pct = yDol / notionalDol
+    x_target_pct = xDol / notionalDol
+    return (y_target_pct, x_target_pct)  
+
+#REMOVE EVENTUALLY*****************************************************************************************
+def sample_comparison_test(context, data):
+    this_month = get_datetime('US/Eastern').month 
+    if context.interval_mod < 0:
+        context.interval_mod = this_month % INTERVAL
+    if (this_month % INTERVAL) != context.interval_mod:
+        return
+    
+    context.num_pairs = context.desired_num_pairs
     empty_data(context)
-    context.universe = pipeline_output('pairs')
-    if (context.universe_size > len(context.universe)):
-        context.universe_size = len(context.universe) - 1
-    context.target_weights = pd.Series(index=context.universe.index, data=0.25)    
-    counter=0
-    while (counter<=context.universe_size):
-        end=counter+context.increments
-        for i in range (counter,end):
-            for j in range (i+1, context.universe_size):
-                s1 = context.universe.index[i]
-                s2 = context.universe.index[j]
-                populate_pairs(context, data, s1, s2)
-        counter+=context.increments
-    for pair in context.coint_pairs:
-        long_ma, short_ma = get_mvg_averages(data, pair[0], pair[1], context.long_ma_length, context.short_ma_length)
-        long_std = get_std(data, pair[0], pair[1], context.long_ma_length)
-        #calculate spread and zscore
-        context.spreads[pair] = (short_ma-long_ma)/long_ma
-        context.zscores[pair] = (short_ma-long_ma)/long_std
+    context.universe_pool = pd.Index([symbol('ABGB'), symbol('FSLR'), symbol('CSUN'), symbol('ASTI')])
+    context.target_weights = get_current_portfolio_weights(context, data)
+    empty_target_weights(context)
     
-        port_val = context.portfolio.portfolio_value
-        top_commission = get_commission(data, s1, port_val*0.5/context.num_pairs)
-        bottom_commission = get_commission(data, s2, port_val*0.5/context.num_pairs)
-        pair_commission = top_commission + bottom_commission
-        context.real_yields[pair] = {}
-        #subtract total commission of pair from % of portfolio value to get real yield
-        context.real_yields[pair]['yield'] = abs(context.spreads[pair]) * port_val-pair_commission
-        context.real_yields[pair]['corr'] = context.coint_data[pair]['corr']
+    abgb_fslr_corr, abgb_fslr_coint = get_corr_coint(data, symbol('ABGB'), symbol('FSLR'),
+                                                           context.price_history_length)
+    csun_asti_corr, csun_asti_coint = get_corr_coint(data, symbol('CSUN'), symbol('ASTI'),
+                                                           context.price_history_length)
+    context.coint_pairs = {
+        (symbol('ABGB'), symbol('FSLR')): {  
+                "corr": abgb_fslr_corr,
+                "coint": abgb_fslr_coint
+            },   
+        (symbol('CSUN'), symbol('ASTI')): {
+                "corr": csun_asti_corr,
+                "coint": csun_asti_coint
+            }
+    }
+    context.real_yield_keys = sorted(context.coint_pairs, key=lambda kv: context.coint_pairs[kv]['coint'], reverse=False)
     
-    #sort pairs from highest to lowest correlations
-    context.real_yield_keys = sorted(context.real_yields, key=lambda kv: context.real_yields[kv]['corr'], reverse=True)
+    temp_real_yield_keys = context.real_yield_keys
+    for pair in temp_real_yield_keys:
+        if (pair[0] in context.total_stock_list) or (pair[1] in context.total_stock_list):
+            context.real_yield_keys.remove(pair)
+            del context.coint_pairs[pair]
+        else:
+            context.total_stock_list.append(pair[0])
+            context.total_stock_list.append(pair[1])
+            
+    if (context.num_pairs > len(context.real_yield_keys)):
+        context.num_pairs = len(context.real_yield_keys) 
+    for i in range(context.num_pairs):
+        context.top_yield_pairs.append(context.real_yield_keys[i])
+        coint = context.coint_pairs[context.real_yield_keys[i]]['coint']
+        corr = context.coint_pairs[context.real_yield_keys[i]]['corr']
+        print("TOP PAIR " + str(i+1) + ": " + str(context.real_yield_keys[i]) 
+              + "\n\t\t\tcorrelation: \t" + str(round(corr,3)) 
+              + "\n\t\t\tcointegration: \t" + str(coint) + "\n")
+    for pair in context.top_yield_pairs:
+        context.pair_status[pair] = {}
+        context.pair_status[pair]['currently_short'] = False
+        context.pair_status[pair]['currently_long'] = False
+    
+    context.universe_set = True
+    context.spread = np.ndarray((context.num_pairs, 0))
+#*************************************************************************************************************
+    
+def choose_pairs(context, data):
+    this_month = get_datetime('US/Eastern').month 
+    if context.interval_mod < 0:
+        context.interval_mod = this_month % INTERVAL
+    if (this_month % INTERVAL) != context.interval_mod:
+        return
+    
+    context.num_pairs = context.desired_num_pairs
+    
+    empty_data(context)
+    size_str = ""
+    for code in context.codes:
+        context.universes[code]['universe'] = algo.pipeline_output(str(code))
+        context.universes[code]['universe'] = context.universes[code]['universe'].index
+        context.universes[code]['size'] = len(context.universes[code]['universe'])
+        if context.universes[code]['size'] > 1:
+            context.universe_set = True
+        size_str = size_str + " " + str(context.universes[code]['size'])
+    print ("CHOOSING PAIRS...\nUniverse sizes:" + size_str)
+    context.universe_pool = context.universes[context.codes[0]]['universe']
+    for code in context.codes:
+        context.universe_pool = context.universe_pool | context.universes[code]['universe']
+    
+    context.target_weights = get_current_portfolio_weights(context, data)
+    empty_target_weights(context)
+    #context.spread = np.ndarray((context.num_pairs, 0))
+    
+    for code in context.codes:
+        for i in range (context.universes[code]['size']):
+            for j in range (i+1, context.universes[code]['size']):
+                s1 = context.universes[code]['universe'][i]
+                s2 = context.universes[code]['universe'][j]
+                correlation, coint_pvalue = get_corr_coint(data, s1, s2,
+                                                           context.price_history_length)
+                context.coint_data[(s1,s2)] = {"corr": correlation, "coint": coint_pvalue}
+                if (coint_pvalue < context.pvalue_th and abs(correlation) > context.corr_th):
+                    context.coint_pairs[(s1,s2)] = context.coint_data[(s1,s2)]   
+    
+    #sort pairs from highest to lowest cointegrations
+    context.real_yield_keys = sorted(context.coint_pairs, key=lambda kv: context.coint_pairs[kv]['coint'], reverse=False)
+    
+    temp_real_yield_keys = context.real_yield_keys
+    for pair in temp_real_yield_keys:
+        if (pair[0] in context.total_stock_list) or (pair[1] in context.total_stock_list):
+            context.real_yield_keys.remove(pair)
+            del context.coint_pairs[pair]
+        else:
+            context.total_stock_list.append(pair[0])
+            context.total_stock_list.append(pair[1])
+        
     
     #select top num_pairs pairs
     if (context.num_pairs > len(context.real_yield_keys)):
         context.num_pairs = len(context.real_yield_keys)
     for i in range(context.num_pairs):
         context.top_yield_pairs.append(context.real_yield_keys[i])
-    
-    #determine weights of each pair based on correlation
-    total_corr = 0
-    for pair in context.top_yield_pairs:
-        total_corr += context.real_yields[pair]['corr']
-    
-    for pair in context.top_yield_pairs:
-        context.pair_weights[pair] = context.real_yields[pair]['corr']/total_corr
-    
-    #print final data
-    print(context.real_yields) #prints yield and correlation of every pair that passed 1st screen
-    print(context.pair_weights) #prints weight of every pair in final list of top pairs
+        u_code = 0
+        for code in context.codes:
+            if context.real_yield_keys[i][0] in context.universes[code]['universe']:
+                u_code = code
+        coint = context.coint_pairs[context.real_yield_keys[i]]['coint']
+        corr = context.coint_pairs[context.real_yield_keys[i]]['corr']
+        print("TOP PAIR " + str(i+1) + ": " + str(context.real_yield_keys[i]) 
+              + "\n\t\t\tsector: \t" + str(u_code) + "\n\t\t\tcorrelation: \t" + str(round(corr,3)) 
+              + "\n\t\t\tcointegration: \t" + str(coint) + "\n")
     
     for pair in context.top_yield_pairs:
         context.pair_status[pair] = {}
         context.pair_status[pair]['currently_short'] = False
         context.pair_status[pair]['currently_long'] = False
-
-def populate_pairs(context, data, s1, s2):
-    #get correlation cointegration values
-    correlation, coint_pvalue = get_corr_coint(data, s1, s2, context.price_history_length)
-    context.coint_data[(s1,s2)] = {"corr": correlation, "coint": coint_pvalue}
-    if (coint_pvalue < context.coint_cutoff and correlation > context.corr_cutoff):
-        context.coint_pairs[(s1,s2)] = context.coint_data[(s1,s2)]
-            
+    
+    context.spread = np.ndarray((context.num_pairs, 0))
+    
 #INCOMPLETE
 def check_pair_status(context, data):
+    if (not context.universe_set):
+        return
     
-    for pair in context.top_yield_pairs:
-        if context.zscores[pair] > context.entry_threshold and not context.pair_status[pair]['currently_short']:
-            set_pair_status(context, pair, -0.5, 0.5, True, False)
+    new_spreads = np.ndarray((context.num_pairs, 1))
+    numPairs = context.num_pairs
+    for i in range(numPairs):
+        pair = context.top_yield_pairs[i]
+        # print pair
+        s1 = pair[0]
+        s2 = pair[1]
         
-        elif context.zscores[pair] < -context.entry_threshold and not context.pair_status[pair]['currently_long']:
-            set_pair_status(context, pair, 0.5, -0.5, False, True)
+        s1_price = data.history(s1, 'price', 35, '1d').iloc[-context.lookback::]
+        s2_price = data.history(s2, 'price', 35, '1d').iloc[-context.lookback::]
+        
+        
+        try:
+            hedge = hedge_ratio(s1_price, s2_price, add_const=True)      
+        except ValueError as e:
+            log.debug(e)
+            return
+        
+        context.target_weights = get_current_portfolio_weights(context, data)
+        new_spreads[i, :] = s1_price[-1] - hedge * s2_price[-1]  
+        if context.spread.shape[1] > context.z_window:
             
-        elif abs(context.zscores[pair]) < context.exit_threshold:
-            set_pair_status(context, pair, 0, 0, False, False) 
-        
-def make_pipeline():
-    """
-    A function to create our dynamic stock selector (pipeline). Documentation
-    on pipeline can be found here:
-    https://www.quantopian.com/help#pipeline-title
-    """
+            spreads = context.spread[i, -context.z_window:]
+            zscore = (spreads[-1] - spreads.mean()) / spreads.std()
 
-    # Base universe set to the QTradableStocksUS
-    base_universe = QTradableStocksUS()
+            if context.pair_status[pair]['currently_short'] and zscore < 0.0:
+                context.target_weights[s1] = 0.0
+                context.target_weights[s2] = 0.0
+                context.pair_status[pair]['currently_short'] = False
+                context.pair_status[pair]['currently_long'] = False
+                #set_pair_status(context, data, s1,s2,s1_price,s2_price, 0, 0, False, False)
+                if REC_PCT:
+                    record(Y_pct=0, X_pct=0)
+                allocate(context, data)
+                return
+            
+            if context.pair_status[pair]['currently_long'] and zscore > 0.0:
+                context.target_weights[s1] = 0.0
+                context.target_weights[s2] = 0.0
+                context.pair_status[pair]['currently_short'] = False
+                context.pair_status[pair]['currently_long'] = False
+                #set_pair_status(context, data, s1,s2,s1_price,s2_price, 0, 0, False, False)
+                if REC_PCT:
+                    record(Y_pct=0, X_pct=0)
+                allocate(context, data)
+                return
+            
+            if zscore < -1.0 and (not context.pair_status[pair]['currently_long']):
+                context.pair_status[pair]['currently_short'] = False
+                context.pair_status[pair]['currently_long'] = True
+                y_target_shares = 1
+                X_target_shares = -hedge
+                (y_target_pct, x_target_pct) = computeHoldingsPct( y_target_shares, X_target_shares, s1_price[-1], s2_price[-1] )
+                
+                context.target_weights[s1] = LEVERAGE * y_target_pct * (1.0/context.num_pairs)
+                context.target_weights[s2] = LEVERAGE * x_target_pct * (1.0/context.num_pairs)
+    
+                if REC_PCT:
+                    record(Y_pct=y_target_pct, X_pct=x_target_pct)
+                #set_pair_status(context,s1,s2,s1_price,s2_price, 1, -hedge, True, False)
+                allocate(context, data)
+                return
+            
+            if zscore > 1.0 and (not context.pair_status[pair]['currently_short']):
+                context.pair_status[pair]['currently_short'] = True
+                context.pair_status[pair]['currently_long'] = False
+                y_target_shares = -1
+                X_target_shares = hedge
+                (y_target_pct, x_target_pct) = computeHoldingsPct( y_target_shares, X_target_shares, s1_price[-1], s2_price[-1] )
+                
+                context.target_weights[s1] = LEVERAGE * y_target_pct * (1.0/context.num_pairs)
+                context.target_weights[s2] = LEVERAGE * x_target_pct * (1.0/context.num_pairs)
+    
+                if REC_PCT:
+                    record(Y_pct=y_target_pct, X_pct=x_target_pct)
+                #set_pair_status(context,s1,s2,s1_price,s2_price, -1, hedge, False, True)
+                allocate(context, data)
+                return
+            
+    context.spread = np.hstack([context.spread, new_spreads])                                   
 
-    # Factor of yesterday's close price.
-    yesterday_close = USEquityPricing.close.latest
-
-    pipe = Pipeline(
-        columns={
-            'close': yesterday_close,
-        },
-        screen=base_universe
+def allocate(context, data):
+    if REC_LEVERAGE:
+        record(leverage=context.account.leverage)
+    print ("ALLOCATING...")
+    for s in context.target_weights.keys():
+        error = ""
+        if (not s in context.target_weights):
+            continue
+        elif (not data.can_trade(s)):
+            error = "Cannot trade " + str(s)
+        elif(np.isnan(context.target_weights.loc[s])):
+            error = "Invalid target weight " + str(s)
+        if error:
+            print(error)
+            # context.universe_set = False
+            # return
+            partner = get_stock_partner(context, s)
+            if not partner in context.target_weights:
+                context.target_weights = context.target_weights.drop([s])
+                context.universe_pool = context.universe_pool.drop([s])
+            else:
+                context.target_weights = context.target_weights.drop([s, partner])
+                context.universe_pool = context.universe_pool.drop([s, partner])
+                print("--> Removing partner " + str(partner) + "...")
+            
+    print ("Target weights:")
+    for s in context.target_weights.keys():
+        if context.target_weights.loc[s] != 0:
+            print ("\t" + str(s) + ":\t" + str(round(context.target_weights.loc[s],3)))
+    # print(context.target_weights.keys())
+    objective = opt.TargetWeights(context.target_weights)
+    
+    
+    # Define constraints
+    constraints = []
+    constraints.append(opt.MaxGrossExposure(MAX_GROSS_EXPOSURE))
+    #print(context.target_weights)
+    algo.order_optimal_portfolio(
+        objective=objective,
+        constraints=constraints,
     )
-    return pipe
-
-
-def before_trading_start(context, data):
-    """
-    Called every day before market open.
-    """
-    context.output = algo.pipeline_output('pipeline')
-
-    # These are the securities that we are interested in trading each day.
-    context.security_list = context.output.index
-
-
-def rebalance(context, data):
-    """
-    Execute orders according to our schedule_function() timing.
-    """
-    pass
-
-
-def record_vars(context, data):
-    """
-    Plot variables at the end of each day.
-    """
-    pass
-
+    
 
 def handle_data(context, data):
-    """
-    Called every minute.
-    """
-    
     pass
+    # if context.account.leverage>LEVERAGE or context.account.leverage < 0:
+    #     warn_leverage(context, data)
