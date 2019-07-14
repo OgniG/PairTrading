@@ -18,34 +18,23 @@ import math
 COMMISSION         = 0.0035
 LEVERAGE           = 1.0
 MAX_GROSS_EXPOSURE = LEVERAGE
-INTERVAL           = 6
+INTERVAL           = 6    
 DESIRED_PAIRS      = 3
-SAMPLE_UNIVERSE    = [(symbol('ABGB'), symbol('FSLR')),
-                      (symbol('ASTI'), symbol('CSUN'))]
+SAMPLE_UNIVERSE    = [(symbol('KO'), symbol('PEP')),
+                      (symbol('DPZ'), symbol('PZZA')),
+                     (symbol('WMT'), symbol('TGT')),(symbol('XOM'), symbol('CVX')),
+                     (symbol('PT'), symbol('TEF')),
+                     (symbol('BHP'), symbol('BBL')), (symbol('ABGB'), symbol('FSLR')),
+                     (symbol('CSUN'), symbol('ASTI'))]
+
+#REAL_UNIVERSE      = [10428070, 10428066, 30946101, 10428067, 10428064, 30951106, 10428065]
+
 REAL_UNIVERSE      = [10209016, 10209017, 10209018, 10209019, 10209020, 30946101, 30947102, 30948103, 30949104,
                       30950105, 30951106, 10428064, 10428065, 10428066, 10428067, 10428068, 10428069, 10428070,
                       31167136, 31167137, 31167138, 31167139, 31167140, 31167141, 31167142, 31167143]
 
 #Cointegration / correlation
-COINT_LOOKBACK         = 730
-COINT_P_MAX            = 0.01
-CORR_MIN               = 0.95
-#ADFuller Test
-ADF_LOOKBACK           = COINT_LOOKBACK
-ADF_P_MAX              = COINT_P_MAX
-#Hurst Test
-HURST_LOOKBACK         = COINT_LOOKBACK
-HURST_H_MIN            = 0.1
-HURST_H_MAX            = 0.5
-#Half-life test
-HALF_LIFE_LOOKBACK     = COINT_LOOKBACK
-HALF_LIFE_MIN          = 10
-HALF_LIFE_MAX          = 14
-HEDGE_LOOKBACK         = 20 # used for regression
-Z_WINDOW               = 20 # used for zscore calculation, must be <= HEDGE_LOOKBACK
-#Shapiro-Wilke test
-SHAPIROWILKE_LOOKBACK  = COINT_LOOKBACK
-SHAPIROWILKE_P_MIN     = 0.05
+INTENDED_P = 0.01
 
 #Choose tests
 RUN_SAMPLE_PAIRS         = False
@@ -57,6 +46,36 @@ RUN_HURST_TEST           = True
 RUN_HALF_LIFE_TEST       = True
 RUN_SHAPIROWILKE_TEST    = True
 
+TESTS = [RUN_COINTEGRATION_TEST, RUN_ADFULLER_TEST, RUN_SHAPIROWILKE_TEST]
+
+NUMTESTS = 0
+
+for TEST in TESTS:
+    if TEST:
+        NUMTESTS += 1
+        
+P_CUTOFF = INTENDED_P/NUMTESTS        
+
+COINT_LOOKBACK         = 730
+COINT_P_MAX            = P_CUTOFF
+CORR_MIN               = 0.95
+#ADFuller Test
+ADF_LOOKBACK           = COINT_LOOKBACK
+ADF_P_MAX              = P_CUTOFF
+#Hurst Test
+HURST_LOOKBACK         = COINT_LOOKBACK
+HURST_H_MIN            = 0.0
+HURST_H_MAX            = 0.5
+#Half-life test
+HALF_LIFE_LOOKBACK     = COINT_LOOKBACK
+HALF_LIFE_MIN          = 10
+HALF_LIFE_MAX          = 16
+HEDGE_LOOKBACK         = 20 # used for regression
+Z_WINDOW               = 20 # used for zscore calculation, must be <= HEDGE_LOOKBACK
+#Shapiro-Wilke test
+SHAPIROWILKE_LOOKBACK  = COINT_LOOKBACK
+SHAPIROWILKE_P_MIN     = P_CUTOFF
+
 #Rank pairs by (select key): 'coint', 'adf', 'corr', 'half-life', 'hurst'
 RANK_BY = 'half-life'
 
@@ -66,7 +85,7 @@ RECORD_LEVERAGE = True
 def initialize(context):
 
     set_slippage(slippage.FixedSlippage(spread=0))
-    set_commission(commission.PerShare(cost=COMMISSION))
+    set_commission(commission.PerShare(cost=COMMISSION, min_trade_cost=10*COMMISSION))
     context.industry_code = ms.asset_classification.morningstar_industry_code.latest
     #ENTER DESIRED SECTOR CODES:
     context.codes = REAL_UNIVERSE
