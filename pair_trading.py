@@ -84,7 +84,7 @@ RECORD_LEVERAGE = True
 
 def initialize(context):
 
-    set_slippage(slippage.FixedSlippage(spread=0))
+    set_slippage(slippage.FixedBasisPointsSlippage())
     set_commission(commission.PerShare(cost=COMMISSION, min_trade_cost=10*COMMISSION))
     context.industry_code = ms.asset_classification.morningstar_industry_code.latest
     #ENTER DESIRED SECTOR CODES:
