@@ -15,8 +15,10 @@ import statsmodels.tsa.stattools as sm
 from scipy.stats import shapiro
 import math
 
-COMMISSION         = 0.0035
+COMMISSION         = 0.005
 LEVERAGE           = 1.0
+ENTRY = 1.0
+EXIT = 0.2 # MUST BE < ENTRY
 MAX_GROSS_EXPOSURE = LEVERAGE
 INTERVAL           = 6    
 DESIRED_PAIRS      = 3
@@ -85,7 +87,7 @@ RECORD_LEVERAGE = True
 def initialize(context):
 
     set_slippage(slippage.FixedBasisPointsSlippage())
-    set_commission(commission.PerShare(cost=COMMISSION, min_trade_cost=10*COMMISSION))
+    set_commission(commission.PerShare(cost=COMMISSION, min_trade_cost=1))
     context.industry_code = ms.asset_classification.morningstar_industry_code.latest
     #ENTER DESIRED SECTOR CODES:
     context.codes = REAL_UNIVERSE
@@ -570,7 +572,7 @@ def check_pair_status(context, data):
             spreads = context.spread[i, -Z_WINDOW:]
             zscore = (spreads[-1] - spreads.mean()) / spreads.std()
 
-            if context.pair_status[pair]['currently_short'] and zscore < 0.0:
+            if context.pair_status[pair]['currently_short'] and zscore < EXIT:
                 context.target_weights[s1] = 0.0
                 context.target_weights[s2] = 0.0
                 context.pair_status[pair]['currently_short'] = False
@@ -581,7 +583,7 @@ def check_pair_status(context, data):
                 allocate(context, data)
                 return
 
-            if context.pair_status[pair]['currently_long'] and zscore > 0.0:
+            if context.pair_status[pair]['currently_long'] and zscore > -EXIT:
                 context.target_weights[s1] = 0.0
                 context.target_weights[s2] = 0.0
                 context.pair_status[pair]['currently_short'] = False
@@ -592,7 +594,7 @@ def check_pair_status(context, data):
                 allocate(context, data)
                 return
 
-            if zscore < -1.0 and (not context.pair_status[pair]['currently_long']):
+            if zscore < -ENTRY and (not context.pair_status[pair]['currently_long']):
                 context.pair_status[pair]['currently_short'] = False
                 context.pair_status[pair]['currently_long'] = True
                 y_target_shares = 1
@@ -608,7 +610,7 @@ def check_pair_status(context, data):
                 allocate(context, data)
                 return
 
-            if zscore > 1.0 and (not context.pair_status[pair]['currently_short']):
+            if zscore > ENTRY and (not context.pair_status[pair]['currently_short']):
                 context.pair_status[pair]['currently_short'] = True
                 context.pair_status[pair]['currently_long'] = False
                 y_target_shares = -1
